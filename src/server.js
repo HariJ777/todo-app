@@ -5,9 +5,14 @@ const cookieParser = require("cookie-parser");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
 const { CloudinaryStorage } = require("multer-storage-cloudinary");
+const http = require("http");
+const { Server } = require("socket.io");
 require("dotenv").config();
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "../public")));
@@ -38,6 +43,8 @@ const upload = multer({ storage: storage });
 const messageSchema = new mongoose.Schema({
   content: { type: String, default: "" },
   imageUrl: { type: String, default: "" },
+  senderName: { type: String, default: "Anonymous" },
+  reactions: { type: Object, default: {} },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -80,6 +87,8 @@ app.get("/api/messages", requireAuth, async (req, res) => {
       id: m._id.toString(),
       content: m.content,
       imageUrl: m.imageUrl,
+      senderName: m.senderName,
+      reactions: m.reactions || {},
       createdAt: m.createdAt
     }));
     res.json(formattedMessages);
@@ -91,25 +100,54 @@ app.get("/api/messages", requireAuth, async (req, res) => {
 app.post("/api/messages", requireAuth, upload.single("image"), async (req, res) => {
   const content = req.body.content || "";
   const imageUrl = req.file ? req.file.path : "";
+  const senderName = req.body.senderName || "Anonymous";
 
   if (!content && !imageUrl) {
     return res.status(400).json({ message: "Content or image required" });
   }
 
   try {
-    const newMessage = new Message({ content, imageUrl });
+    const newMessage = new Message({ content, imageUrl, senderName, reactions: {} });
     await newMessage.save();
-    res.status(201).json({
-      message: "Message added",
-      data: {
-        id: newMessage._id.toString(),
-        content: newMessage.content,
-        imageUrl: newMessage.imageUrl,
-        createdAt: newMessage.createdAt
-      }
-    });
+
+    const formattedMessage = {
+      id: newMessage._id.toString(),
+      content: newMessage.content,
+      imageUrl: newMessage.imageUrl,
+      senderName: newMessage.senderName,
+      reactions: newMessage.reactions,
+      createdAt: newMessage.createdAt
+    };
+
+    io.emit('newMessage', formattedMessage);
+    res.status(201).json({ message: "Message added", data: formattedMessage });
   } catch (err) {
     res.status(500).json({ message: "Error adding message" });
+  }
+});
+
+app.post("/api/messages/:id/react", requireAuth, async (req, res) => {
+  const id = req.params.id;
+  const { emoji } = req.body;
+  if (!emoji) return res.status(400).json({ message: "Emoji required" });
+
+  try {
+    const msg = await Message.findById(id);
+    if (!msg) return res.status(404).json({ message: "Message not found" });
+
+    // Increment reaction count
+    const currentCount = msg.reactions[emoji] || 0;
+    const newReactions = { ...msg.reactions, [emoji]: currentCount + 1 };
+
+    // Mongoose requires markModified for mixed types
+    msg.reactions = newReactions;
+    msg.markModified('reactions');
+    await msg.save();
+
+    io.emit('messageReacted', { id: msg._id.toString(), reactions: msg.reactions });
+    res.json({ success: true, reactions: msg.reactions });
+  } catch (err) {
+    res.status(500).json({ message: "Error reacting to message" });
   }
 });
 
@@ -118,11 +156,19 @@ app.delete("/api/messages/:id", requireAuth, async (req, res) => {
   try {
     const deletedMessage = await Message.findByIdAndDelete(id);
     if (!deletedMessage) return res.status(404).json({ message: "Message not found" });
+
+    io.emit('messageDeleted', id);
     res.json({ message: "Message deleted", id });
   } catch (err) {
     res.status(500).json({ message: "Error deleting message" });
   }
 });
 
+app.use((err, req, res, next) => {
+  console.error("EXPRESS ERROR CAUGHT:", err);
+  res.status(500).json({ message: "Internal server error", error: err.message || err });
+});
+
+// Use server.listen instead of app.listen for Socket.io
 const port = process.env.PORT || 5001;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+server.listen(port, () => console.log(`Server running on port ${port}`));
